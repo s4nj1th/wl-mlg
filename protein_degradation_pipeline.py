@@ -102,44 +102,117 @@ AA_PHYSCHEM: Dict[str, str] = {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1.  MOCK FIREPROT DB  +  BINARY LABELS
+# 1.  REAL FIREPROTDB LOADER  +  BINARY LABELS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_mock_fireprotdb() -> pd.DataFrame:
+def load_fireprotdb(csv_path: str,
+                    max_proteins: int = 50,
+                    random_state: int = 42) -> pd.DataFrame:
     """
-    Create a mock DataFrame that mimics the FireProtDB schema.
+    Load the real FireProtDB CSV export and return a clean DataFrame.
 
-    Columns
+    FireProtDB schema notes (from the actual export)
+    -------------------------------------------------
+    - Column names are UPPERCASE (DDG, WWPDB, …).
+    - DDG   : ΔΔG in kcal/mol — our target.  Many rows are NaN.
+    - WWPDB : PDB accession(s) for the wild-type structure.
+              Can be comma-separated (e.g. "1YGW, 1RN1") when multiple
+              crystal forms exist; we take the first clean 4-char code.
+    - ~5.4M total rows, but only ~7,977 have both DDG and WWPDB.
+
+    Strategy
+    --------
+    1. Load only the two needed columns to avoid reading 1.7 GB into RAM.
+    2. Drop rows missing DDG or WWPDB.
+    3. Parse the first valid 4-character PDB code from WWPDB.
+    4. Deduplicate: one representative row per unique PDB ID
+       (median DDG of all mutations on that protein).
+       This is intentional — the WL kernel operates on the STRUCTURE,
+       so all mutations on the same PDB chain produce the same graph.
+       We keep one label per protein so the kernel matrix is meaningful.
+    5. Cap at max_proteins (default 50) for tractable kernel computation.
+       The full N×N matrix for 175 proteins × 20 WL iterations is fast,
+       but 175² = 30,625 entries → still very manageable if desired.
+
+    Parameters
+    ----------
+    csv_path     : str  — path to the FireProtDB CSV file.
+    max_proteins : int  — maximum number of unique proteins to use.
+                          Set to None to use all (~175 unique proteins).
+    random_state : int  — seed for reproducible sub-sampling.
+
+    Returns
     -------
-    pdb_id : str
-        4-character PDB accession code.
-    ddG    : float
-        Free-energy change upon mutation (kcal/mol).
-        Positive → stabilising mutation (Stable),  ΔΔG ≥ 0
-        Negative → destabilising mutation (Unstable), ΔΔG < 0
-    label  : int
-        Binary target: 1 = Stable, 0 = Unstable.
-
-    We choose five small, well-resolved, diverse PDB structures so that
-    Biopython can actually download them during the demo run.
+    pd.DataFrame with columns: pdb_id, ddG, label
     """
-    data = {
-        # PDB IDs: small monomeric proteins with good Cα coverage
-        "pdb_id": ["1UBQ", "1L2Y", "2LZM", "1VII", "1CRN",
-                   "1UBQ", "1L2Y", "2LZM", "1VII", "1CRN",
-                   "1UBQ", "1L2Y", "2LZM", "1VII", "1CRN",
-                   "1UBQ", "1L2Y", "2LZM", "1VII", "1CRN"],
-        "ddG":    [ 1.2, -0.5,  2.1, -1.3,  0.8,
-                   -2.0,  0.3, -0.7,  1.5, -0.2,
-                    0.1, -1.8,  0.9, -0.4,  2.5,
-                   -0.9,  1.1, -1.5,  0.6, -0.1],
-    }
-    df = pd.DataFrame(data)
-    # Binary label: 1 = Stable (ΔΔG ≥ 0), 0 = Unstable (ΔΔG < 0)
-    df["label"] = (df["ddG"] >= 0).astype(int)
-    print(f"[FireProtDB mock] {len(df)} records | "
-          f"Stable={df['label'].sum()} | Unstable={(df['label']==0).sum()}")
-    return df
+    print(f"[FireProtDB] Loading CSV: {csv_path}")
+    print(f"[FireProtDB] Reading columns DDG + WWPDB …")
+
+    # Read only the two relevant columns — avoids loading the full 1.7 GB
+    df_raw = pd.read_csv(
+        csv_path,
+        usecols=["DDG", "WWPDB"],
+        low_memory=False,
+    )
+    print(f"[FireProtDB] Raw rows: {len(df_raw):,}")
+
+    # ── Keep only rows with both DDG and WWPDB ────────────────────────────
+    df_raw = df_raw.dropna(subset=["DDG", "WWPDB"])
+    print(f"[FireProtDB] Rows with DDG + WWPDB: {len(df_raw):,}")
+
+    # ── Parse first valid 4-character PDB code from WWPDB ─────────────────
+    # WWPDB can be "1WQ5" or "1YGW, 1RN1, 9RNT" — we take the first token
+    # that matches the 4-alphanumeric PDB format.
+    def extract_pdb_id(wwpdb_str: str) -> Optional[str]:
+        # Split on comma/space, strip whitespace, keep first 4-char match
+        for token in re.split(r"[,\s]+", str(wwpdb_str)):
+            token = token.strip().upper()
+            if re.fullmatch(r"[A-Z0-9]{4}", token):
+                return token
+        return None
+
+    df_raw["pdb_id"] = df_raw["WWPDB"].apply(extract_pdb_id)
+    df_raw = df_raw.dropna(subset=["pdb_id"])
+
+    # ── Rename and cast DDG ───────────────────────────────────────────────
+    df_raw = df_raw.rename(columns={"DDG": "ddG"})
+    df_raw["ddG"] = pd.to_numeric(df_raw["ddG"], errors="coerce")
+    df_raw = df_raw.dropna(subset=["ddG"])
+
+    # ── Deduplicate: one row per unique PDB ID ────────────────────────────
+    # Aggregate all mutations on the same protein → median ΔΔG.
+    # This gives each protein a single representative stability label
+    # that reflects its overall mutational landscape.
+    df_protein = (
+        df_raw.groupby("pdb_id", as_index=False)["ddG"]
+        .median()
+        .rename(columns={"ddG": "ddG"})
+    )
+    print(f"[FireProtDB] Unique proteins after dedup: {len(df_protein)}")
+
+    # ── Binary label ──────────────────────────────────────────────────────
+    df_protein["label"] = (df_protein["ddG"] >= 0).astype(int)
+
+    # ── Sub-sample if needed ──────────────────────────────────────────────
+    if max_proteins is not None and len(df_protein) > max_proteins:
+        # Stratified sample to preserve class balance
+        stable   = df_protein[df_protein["label"] == 1]
+        unstable = df_protein[df_protein["label"] == 0]
+        n_stable   = min(len(stable),   max_proteins // 2)
+        n_unstable = min(len(unstable), max_proteins - n_stable)
+        df_protein = pd.concat([
+            stable.sample(n_stable,   random_state=random_state),
+            unstable.sample(n_unstable, random_state=random_state),
+        ]).reset_index(drop=True)
+        print(f"[FireProtDB] Sampled to {len(df_protein)} proteins "
+              f"(max_proteins={max_proteins}).")
+
+    df_protein = df_protein[["pdb_id", "ddG", "label"]].reset_index(drop=True)
+
+    print(f"[FireProtDB] Final: {len(df_protein)} records | "
+          f"Stable(ΔΔG≥0)={df_protein['label'].sum()} | "
+          f"Unstable(ΔΔG<0)={(df_protein['label']==0).sum()}")
+    return df_protein
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -710,19 +783,34 @@ class EdgeConditionedWLKernel:
 # 5.  FULL PIPELINE ORCHESTRATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_pipeline():
+def run_pipeline(
+    csv_path: str = "fireprotdb_20251015-164116.csv",
+    max_proteins: int = 50,
+    wl_iters: int = 3,
+    allow_synthetic: bool = False,
+):
     """
     End-to-end pipeline:
-      FireProtDB mock → PDB fetch → RCN build → WL kernel → SVM → report
+      Real FireProtDB CSV → PDB fetch → RCN build → WL kernel → SVM → report
+
+    Parameters
+    ----------
+    csv_path        : path to the FireProtDB CSV export.
+    max_proteins    : how many unique proteins to use (keeps kernel tractable).
+                      Set to None to use all 175 available proteins.
+    wl_iters        : number of WL refinement iterations.
+    allow_synthetic : fall back to synthetic Cα data if RCSB download fails.
+                      Default False for real-data runs; set True for offline demos.
     """
     print("=" * 70)
     print("  PROTEIN DEGRADATION PREDICTION — Custom Edge-Conditioned WL Kernel")
     print("=" * 70)
 
-    # ── 1. Build mock dataset ─────────────────────────────────────────────
-    print("\n[Step 1] Building mock FireProtDB …")
-    df = build_mock_fireprotdb()
-    print(df.to_string(index=False))
+    # ── 1. Load real FireProtDB CSV ───────────────────────────────────────
+    print(f"\n[Step 1] Loading real FireProtDB data from '{csv_path}' …")
+    df = load_fireprotdb(csv_path, max_proteins=max_proteins)
+    print("\n  Sample rows:")
+    print(df.head(10).to_string(index=False))
 
     # ── 2. Fetch PDB structures & build RCNs ──────────────────────────────
     print("\n[Step 2] Fetching PDB structures and constructing RCNs …")
@@ -730,15 +818,16 @@ def run_pipeline():
     pdb_cache: Dict[str, Optional[dict]] = {}   # avoid re-downloading
     graphs:    List[dict]  = []
     labels:    List[int]   = []
-    meta:      List[dict]  = []   # for later diagnostics
+    meta:      List[dict]  = []
 
     for _, row in df.iterrows():
         pdb_id = row["pdb_id"]
         label  = int(row["label"])
         ddG    = float(row["ddG"])
 
-        # Fetch real PDB data; fall back to synthetic if network unavailable
-        pdb_data = get_pdb_data(pdb_id, cache=pdb_cache)
+        # Fetch real PDB from RCSB; fall back to synthetic only if enabled
+        pdb_data = get_pdb_data(pdb_id, cache=pdb_cache,
+                                allow_synthetic=allow_synthetic)
         if pdb_data is None:
             print(f"  [SKIP] {pdb_id} — could not build RCN.")
             continue
@@ -764,20 +853,26 @@ def run_pipeline():
           f"Stable={labels.sum()}  |  Unstable={(labels==0).sum()}")
 
     # ── 3. Custom Edge-Conditioned WL Kernel ──────────────────────────────
-    print("\n[Step 3] Computing custom Edge-Conditioned WL kernel …")
-    wl_kernel = EdgeConditionedWLKernel(n_iter=3)
+    print(f"\n[Step 3] Computing custom Edge-Conditioned WL kernel (iters={wl_iters}) …")
+    wl_kernel = EdgeConditionedWLKernel(n_iter=wl_iters)
     K_full    = wl_kernel.fit_transform(graphs)   # shape (N, N)
 
     # Normalise kernel matrix: K_norm[i,j] = K[i,j] / sqrt(K[i,i] * K[j,j])
     # This maps the kernel values to [-1, 1] (analogous to cosine similarity),
     # preventing graphs with more nodes from dominating purely due to size.
-    diag     = np.sqrt(np.diag(K_full))
+    diag      = np.sqrt(np.diag(K_full))
     diag_safe = np.where(diag == 0, 1.0, diag)   # avoid division by zero
-    K_norm   = K_full / np.outer(diag_safe, diag_safe)
-    K_norm   = np.clip(K_norm, 0.0, None)         # ensure non-negativity (PSD)
+    K_norm    = K_full / np.outer(diag_safe, diag_safe)
+    K_norm    = np.clip(K_norm, 0.0, None)         # ensure non-negativity (PSD)
 
-    print("\nNormalised Kernel Matrix (K_norm):")
-    print(np.round(K_norm, 3))
+    # Only print the full matrix for small datasets (≤20 proteins)
+    if len(graphs) <= 20:
+        print("\nNormalised Kernel Matrix (K_norm):")
+        print(np.round(K_norm, 3))
+    else:
+        print(f"\nKernel matrix computed: {K_norm.shape}  "
+              f"min={K_norm.min():.3f}  max={K_norm.max():.3f}  "
+              f"mean={K_norm.mean():.3f}")
 
     # ── 4. Train/Test split on the precomputed kernel matrix ──────────────
     print("\n[Step 4] Splitting kernel matrix into train / test sets …")
@@ -810,7 +905,7 @@ def run_pipeline():
     print("\n[Step 5] Training SVC (precomputed WL kernel) …")
     svc = SVC(
         kernel="precomputed",
-        class_weight="balanced",   # compensate for possible class imbalance
+        class_weight="balanced",   # compensate for 70/30 class imbalance
         C=1.0,
         random_state=42,
     )
@@ -834,7 +929,6 @@ def run_pipeline():
     # Sort by label integer (order of discovery = BFS-like expansion order)
     sorted_motifs = sorted(wl_kernel.label_dict.items(), key=lambda x: x[1])
     for motif_str, motif_id in sorted_motifs[:20]:
-        # Truncate long motif strings for readability
         display = (motif_str[:80] + "…") if len(motif_str) > 80 else motif_str
         print(f"  [{motif_id:4d}] {display}")
     if len(sorted_motifs) > 20:
@@ -855,4 +949,9 @@ def run_pipeline():
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    results = run_pipeline()
+    results = run_pipeline(
+        csv_path     = "fireprotdb_20251015-164116.csv",
+        max_proteins = 50,     # use 50 unique proteins for a fast first run
+        wl_iters     = 3,      # WL refinement depth
+        allow_synthetic = False,  # require real PDB downloads from RCSB
+    )
